@@ -47,11 +47,20 @@ def load_points():
     if os.path.exists(POINTS_FILE):
         with open(POINTS_FILE, "r") as f:
             return json.load(f)
-    return {}
+    return {"_repped": []}
 
 def save_points(data):
     with open(POINTS_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+def load_repped() -> set:
+    data = load_points()
+    return set(data.get("_repped", []))
+
+def save_repped(repped: set):
+    data = load_points()
+    data["_repped"] = list(repped)
+    save_points(data)
 
 def get_user_data(points_data: dict, user_id: int) -> dict:
     key = str(user_id)
@@ -84,7 +93,35 @@ intents.messages = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-repped_members: set = set()
+repped_members: set = load_repped()
+
+def load_messaged() -> set:
+    data = load_points()
+    return set(data.get("_messaged", []))
+
+def save_messaged(messaged: set):
+    data = load_points()
+    data["_messaged"] = list(messaged)
+    save_points(data)
+
+messaged_members: set = load_messaged()
+
+def load_last_repping() -> dict:
+    """Persisted map of user_id (str) -> bool, the last known repping
+    state while that user was actually online. We compare against this
+    instead of discord.py's `before` snapshot, because Discord doesn't
+    send reliable activity data for offline/invisible members — relying
+    on `before` makes "going offline and coming back with the same
+    status" look like a fresh status change every single time."""
+    data = load_points()
+    return data.get("_last_repping", {})
+
+def save_last_repping(state: dict):
+    data = load_points()
+    data["_last_repping"] = state
+    save_points(data)
+
+last_repping_state: dict = load_last_repping()
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -122,6 +159,19 @@ async def on_ready():
                 if role in member.roles:
                     repped_members.add(member.id)
 
+    # Seed last_repping_state from members who are currently online and
+    # already repping, so a restart doesn't make the next presence event
+    # look like a fresh status change for them.
+    for member in guild.members:
+        if member.status == discord.Status.offline:
+            continue
+        uid = str(member.id)
+        if uid in last_repping_state:
+            continue
+        status_text = get_custom_status(member)
+        last_repping_state[uid] = has_rep_keyword(status_text)
+    save_last_repping(last_repping_state)
+
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -141,6 +191,13 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_presence_update(before: discord.Member, after: discord.Member):
+    # NOTE: `before` is intentionally not used for status comparison.
+    # Discord's cached `before` snapshot is unreliable across
+    # offline/invisible transitions (activities go blank), which used to
+    # make "go offline, come back online with the same status" look like
+    # a brand new status change every time. We instead compare against our
+    # own persisted last_repping_state, which is only ever updated while
+    # the member is actually online.
     if after.guild.id != GUILD_ID:
         return
 
@@ -149,11 +206,22 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     if not channel_id or not role_id:
         return
 
-    before_status = get_custom_status(before)
-    after_status = get_custom_status(after)
+    # No reliable activity data while offline/invisible — ignore entirely.
+    if after.status == discord.Status.offline:
+        return
 
+    after_status = get_custom_status(after)
     now_repping = has_rep_keyword(after_status)
-    was_repping = has_rep_keyword(before_status)
+
+    uid = str(after.id)
+    was_repping = last_repping_state.get(uid, False)
+
+    # No real change since the last time we saw them online — do nothing.
+    if now_repping == was_repping:
+        return
+
+    last_repping_state[uid] = now_repping
+    save_last_repping(last_repping_state)
 
     guild = after.guild
     role = guild.get_role(int(role_id))
@@ -162,39 +230,45 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     if role is None or channel is None:
         return
 
-    if now_repping and not was_repping and after.id not in repped_members:
-        repped_members.add(after.id)
+    if now_repping and not was_repping:
+        # Give role if they don't have it
+        if role not in after.roles:
+            try:
+                await after.add_roles(role, reason="Repping snoopys in status")
+            except discord.Forbidden:
+                print(f"Missing permissions to add role to {after}")
+                return
 
-        try:
-            await after.add_roles(role, reason="Repping snoopys in status")
-        except discord.Forbidden:
-            print(f"Missing permissions to add role to {after}")
-            return
+        # Send embed only once ever, tracked permanently
+        if after.id not in messaged_members:
+            messaged_members.add(after.id)
+            save_messaged(messaged_members)
 
-        embed = discord.Embed(
-            description=(
-                "︶︶ . **thank** you so **mu**ch ! 𓂅  <a:snoopy_kiss:1514019676940664882>\n"
-                "<a:snoopy_hearts:1514019575560278149> **>ᴗ<** **__for__** **_repping_** **___snoopy____**"
-            ),
-            color=0xFFFFFF
-        )
+            embed = discord.Embed(
+                description=(
+                    "︶︶ . **thank** you so **mu**ch ! 𓂅  <a:snoopy_kiss:1514019676940664882>\n"
+                    "<a:snoopy_hearts:1514019575560278149> **>ᴗ<** **__for__** **_repping_** **___snoopy____**"
+                ),
+                color=0xFFFFFF
+            )
 
-        server_icon = guild.icon.url if guild.icon else None
-        embed.set_author(name=guild.name, icon_url=server_icon)
-        embed.set_footer(text=after.name, icon_url=after.display_avatar.url)
-        embed.set_image(url="https://media.discordapp.net/attachments/1515746612503380192/1519036965968936970/image.png?ex=6a3f64ab&is=6a3e132b&hm=fa7b42afac15d4c670105817254e4edd35ef60a9aee00781c97b643586458237&=&format=webp&quality=lossless&width=1730&height=328")
+            server_icon = guild.icon.url if guild.icon else None
+            embed.set_author(name=guild.name, icon_url=server_icon)
+            embed.set_footer(text=after.name, icon_url=after.display_avatar.url)
+            embed.set_image(url="https://media.discordapp.net/attachments/1515746612503380192/1519036965968936970/image.png?ex=6a3f64ab&is=6a3e132b&hm=fa7b42afac15d4c670105817254e4edd35ef60a9aee00781c97b643586458237&=&format=webp&quality=lossless&width=1730&height=328")
 
-        await channel.send(
-            content=f"⠀⠀⠀⠀<:snoopy_heart:1514019425962033272>⠀⠀✎ ⠀{after.mention} ⠀⊹ ⠀<:snoopy_clap:1514019079151685632>",
-            embed=embed
-        )
+            await channel.send(
+                content=f"⠀⠀⠀⠀<:snoopy_heart:1514019425962033272>⠀⠀✎ ⠀{after.mention} ⠀⊹ ⠀<:snoopy_clap:1514019079151685632>",
+                embed=embed
+            )
 
-    elif not now_repping and was_repping and after.id in repped_members:
-        repped_members.discard(after.id)
-        try:
-            await after.remove_roles(role, reason="Removed snoopys from status")
-        except discord.Forbidden:
-            print(f"Missing permissions to remove role from {after}")
+    elif not now_repping and was_repping:
+        # Remove role if they still have it
+        if role in after.roles:
+            try:
+                await after.remove_roles(role, reason="Removed snoopys from status")
+            except discord.Forbidden:
+                print(f"Missing permissions to remove role from {after}")
 
 
 # ── Commands ─────────────────────────────────────────────────────────────────
